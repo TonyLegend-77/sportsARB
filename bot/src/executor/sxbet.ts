@@ -1,58 +1,87 @@
-import { Wallet, ZeroAddress, ZeroHash, hexlify, randomBytes } from 'ethers';
+import { Wallet, hexlify, randomBytes } from 'ethers';
 import { config } from '../config';
 
-const BASE_TOKEN = '0x6629Ce1Cf35Cc1329ebB4F63202F3f197b3F050B';
-const CHAIN_ID = 4162; // SX Mainnet
-const EIP712_FILL_HASHER = '0x845a2Da2D70fEDe8474b1C8518200798c60aC364';
-const USDC_DECIMALS = 1_000_000;
-const ODDS_PRECISION = BigInt('100000000000000000000'); // 10^20
+// SX Bet V3 cut over August 26, 2026 — the V2 /orders/fill/v2 endpoint and its
+// "FillObject" EIP-712 struct are gone. Taking liquidity is now the same
+// endpoint as posting (POST /orders-v3), distinguished only by timeInForce.
+// See https://docs.sx.bet/developers/migrate-to-v3 and
+// https://docs.sx.bet/developers/taking-liquidity.
+//
+// Domain and baseToken are no longer hardcoded — they come from GET
+// /metadata/obv3 on every call. That endpoint is cheap and this isn't a
+// hot path (one call per arb leg), so no caching layer here beyond a short
+// TTL; simpler, and can't go stale mid-trade.
 
-const DOMAIN = {
-  name: 'SX Bet',
-  version: '6.0',
-  chainId: CHAIN_ID,
-  verifyingContract: EIP712_FILL_HASHER,
-};
+const ODDS_PRECISION = 10n ** 20n; // percentageOdds scale
+const USDC_DECIMALS = 1_000_000; // totalBetSize scale
 
-const TYPES = {
-  Details: [
-    { name: 'action', type: 'string' },
-    { name: 'market', type: 'string' },
-    { name: 'betting', type: 'string' },
-    { name: 'stake', type: 'string' },
-    { name: 'worstOdds', type: 'string' },
-    { name: 'worstReturning', type: 'string' },
-    { name: 'fills', type: 'FillObject' },
-  ],
-  FillObject: [
-    { name: 'stakeWei', type: 'string' },
-    { name: 'marketHash', type: 'string' },
-    { name: 'baseToken', type: 'string' },
-    { name: 'desiredOdds', type: 'string' },
-    { name: 'oddsSlippage', type: 'uint256' },
-    { name: 'isTakerBettingOutcomeOne', type: 'bool' },
-    { name: 'fillSalt', type: 'uint256' },
-    { name: 'beneficiary', type: 'address' },
-    { name: 'beneficiaryType', type: 'uint8' },
-    { name: 'cashOutTarget', type: 'bytes32' },
+const ORDER_TYPES = {
+  Order: [
+    { name: 'marketHash', type: 'bytes32' },
+    { name: 'baseToken', type: 'address' },
+    { name: 'totalBetSize', type: 'uint256' },
+    { name: 'percentageOdds', type: 'uint256' },
+    { name: 'salt', type: 'uint256' },
+    { name: 'expiry', type: 'uint256' },
+    { name: 'maker', type: 'address' },
+    { name: 'isMakerBettingOutcomeOne', type: 'bool' },
   ],
 };
+
+interface Metadata {
+  domain: { name: string; version: string; chainId: number; verifyingContract: string };
+  activeAsset: { baseToken: string };
+}
+
+interface OrdersV3Response {
+  status: 'success' | 'FAILED';
+  data?: {
+    orders: Array<{
+      orderId: string;
+      status: 'SUBMITTED' | 'FAILED';
+      outcome?: {
+        state: 'FULLY_FILLED' | 'PARTIAL_FILL_DONE' | 'NO_FILL' | string;
+        remainingAmount: string;
+        fillAmount: string;
+        blendedOdds: string;
+        tradeId?: string;
+      };
+    }>;
+  };
+  errors?: unknown;
+}
 
 export interface SxFillResult {
-  fillHash: string;
+  fillHash: string; // tradeId (or orderId if a trade never formed) — used as our internal reference
   isPartialFill: boolean;
-  filledSize: number; // USDC
-  fillOdds: number; // 0–1
+  filledSize: number; // USDC actually filled
+  fillOdds: number; // 0–1, blended taker odds actually received
+}
+
+let metadataCache: { data: Metadata; fetchedAt: number } | null = null;
+const METADATA_TTL_MS = 60_000;
+
+async function getMetadata(): Promise<Metadata> {
+  if (metadataCache && Date.now() - metadataCache.fetchedAt < METADATA_TTL_MS) {
+    return metadataCache.data;
+  }
+  const res = await fetch(`${config.SX_BET_API_URL}/metadata/obv3`);
+  if (!res.ok) throw new Error(`SX metadata fetch failed (${res.status})`);
+  const body = (await res.json()) as { data: Metadata };
+  metadataCache = { data: body.data, fetchedAt: Date.now() };
+  return body.data;
 }
 
 /**
- * Execute a taker fill on SX Bet.
+ * Execute a taker fill on SX Bet V3 by posting an IOC order.
  *
- * @param _gameExternalId  - game-level externalId (not used for execution)
- * @param externalOutcomeId - outcome externalId in format "${specificMarketHash}:0"
- *   where the suffix "0" means isTakerBettingOutcomeOne=true (always the case for 1X2)
+ * @param _gameExternalId  - unused (kept for call-site compatibility with the arb scanner / router)
+ * @param externalOutcomeId - outcome externalId in format "${specificMarketHash}:0|1", where the
+ *   suffix is which side we're betting — see adapters/sxbet.ts for how this is built.
+ *   "0" means we bet outcomeOne, "1" means outcomeTwo.
  * @param size - USDC amount to stake
- * @param desiredOddsDecimal - worst acceptable taker odds (0–1), e.g. 0.475
+ * @param desiredOddsDecimal - worst acceptable taker odds (0–1), e.g. 0.475 — matches at this
+ *   price or better; V3 has no separate slippage field, percentageOdds itself is the bound.
  */
 export async function executeSxBetFill(
   _gameExternalId: string,
@@ -60,102 +89,81 @@ export async function executeSxBetFill(
   size: number,
   desiredOddsDecimal: number,
 ): Promise<SxFillResult> {
-  // Parse the specific binary market hash and outcome direction from the combined externalId
   const colonIdx = externalOutcomeId.lastIndexOf(':');
   if (colonIdx < 0) {
     throw new Error(`Invalid SX Bet outcome externalId (expected "hash:index"): ${externalOutcomeId}`);
   }
   const marketHash = externalOutcomeId.slice(0, colonIdx);
   const outcomeIndex = externalOutcomeId.slice(colonIdx + 1);
+  const isMakerBettingOutcomeOne = outcomeIndex === '0';
 
   if (!config.SX_PRIVATE_KEY) throw new Error('SX trading credentials are not configured (READ_ONLY_MODE is active)');
   const wallet = new Wallet(config.SX_PRIVATE_KEY);
 
-  const isTakerBettingOutcomeOne = outcomeIndex === '0';
-  const stakeWei = String(Math.round(size * USDC_DECIMALS));
+  const meta = await getMetadata();
 
-  // desiredOdds in SX format: takerImplied * 10^20
-  const desiredOdds = String(BigInt(Math.round(desiredOddsDecimal * 1e18)) * BigInt(100));
+  const totalBetSize = String(Math.round(size * USDC_DECIMALS));
+  // percentageOdds is our own outcome's implied probability, worst-acceptable, at 10^20 scale.
+  const percentageOdds = String(BigInt(Math.round(desiredOddsDecimal * 1e18)) * 100n);
+  const salt = hexlify(randomBytes(32));
+  const expiry = Math.floor(Date.now() / 1000) + 3600; // 1 hour out — real unix seconds, required in V3
 
-  const fillSalt = BigInt(hexlify(randomBytes(32))).toString();
-
-  const message = {
-    action: 'N/A',
-    market: marketHash,
-    betting: 'N/A',
-    stake: 'N/A',
-    worstOdds: 'N/A',
-    worstReturning: 'N/A',
-    fills: {
-      stakeWei,
-      marketHash,
-      baseToken: BASE_TOKEN,
-      desiredOdds,
-      oddsSlippage: 0,
-      isTakerBettingOutcomeOne,
-      fillSalt,
-      beneficiary: ZeroAddress,
-      beneficiaryType: 0,
-      cashOutTarget: ZeroHash,
-    },
+  const order = {
+    marketHash,
+    baseToken: meta.activeAsset.baseToken,
+    totalBetSize,
+    percentageOdds,
+    salt,
+    expiry,
+    maker: wallet.address,
+    isMakerBettingOutcomeOne,
   };
 
-  const takerSig = await wallet.signTypedData(DOMAIN, TYPES, message);
+  const orderSignature = await wallet.signTypedData(meta.domain, ORDER_TYPES, order);
 
-  const body = {
-    market: marketHash,
-    baseToken: BASE_TOKEN,
-    isTakerBettingOutcomeOne,
-    stakeWei,
-    desiredOdds,
-    oddsSlippage: 0,
-    taker: wallet.address,
-    takerSig,
-    fillSalt,
-    message: 'N/A',
-  };
-
-  const res = await fetch(`${config.SX_BET_API_URL}/orders/fill/v2`, {
+  const res = await fetch(`${config.SX_BET_API_URL}/orders-v3`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
+    headers: { 'Content-Type': 'application/json', 'x-sx-api-key': config.SX_BET_API_KEY },
+    body: JSON.stringify({
+      orders: [{ ...order, timeInForce: 'IOC', orderSignature }],
+      // Block for the match result instead of the new-default async behavior —
+      // we need to know the fill outcome synchronously to report it back to
+      // the arb scanner / trade route.
+      waitForOutcome: true,
+    }),
   });
 
   if (!res.ok) {
     const text = await res.text().catch(() => '');
-    throw new Error(`SX Bet fill failed (${res.status}): ${text}`);
+    throw new Error(`SX Bet order failed (${res.status}): ${text}`);
   }
 
-  const result = (await res.json()) as {
-    status: string;
-    data: {
-      fillHash?: string;
-      isPartialFill?: boolean;
-      bettor?: string;
-      stake?: string;
-      odds?: string;
-    };
-  };
+  const result = (await res.json()) as OrdersV3Response;
+  const orderResult = result.data?.orders?.[0];
 
-  if (result.status !== 'success') {
-    throw new Error(`SX Bet fill rejected: ${JSON.stringify(result)}`);
+  if (result.status !== 'success' || !orderResult) {
+    throw new Error(`SX Bet order rejected: ${JSON.stringify(result)}`);
+  }
+  if (orderResult.status === 'FAILED') {
+    throw new Error(`SX Bet order failed: ${JSON.stringify(orderResult)}`);
   }
 
-  const fillHash = result.data.fillHash ?? `fill_${fillSalt}`;
-  const isPartialFill = result.data.isPartialFill ?? false;
+  const outcome = orderResult.outcome;
+  const fillAmountRaw = outcome?.fillAmount ?? '0';
+  const filledSize = parseInt(fillAmountRaw, 10) / USDC_DECIMALS;
 
-  // Parse fill odds from response (SX format: divide by 10^20)
-  let fillOdds = desiredOddsDecimal;
-  if (result.data.odds) {
-    const rawOdds = BigInt(result.data.odds);
-    fillOdds = Number(rawOdds) / Number(ODDS_PRECISION);
+  if (filledSize <= 0) {
+    // IOC with nothing matched — SUBMITTED but no trade. Treat as a failure
+    // so the caller's fail-handling path runs (no funds moved, nothing to mark filled).
+    throw new Error(`SX Bet IOC did not match: ${outcome?.state ?? 'NO_FILL'}`);
   }
 
-  // Actual filled USDC — may be partial
-  let filledSize = size;
-  if (result.data.stake) {
-    filledSize = parseInt(result.data.stake, 10) / USDC_DECIMALS;
-  }
+  const fillOdds = outcome?.blendedOdds
+    ? Number(BigInt(outcome.blendedOdds)) / Number(ODDS_PRECISION)
+    : desiredOddsDecimal;
+
+  const isPartialFill = outcome?.state === 'PARTIAL_FILL_DONE';
+  const fillHash = outcome?.tradeId ?? orderResult.orderId;
 
   return { fillHash, isPartialFill, filledSize, fillOdds };
 }

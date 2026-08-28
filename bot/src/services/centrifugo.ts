@@ -4,20 +4,28 @@ import { config } from '../config';
 import { prisma } from '../db';
 import { createLogger } from '../logger';
 import { oddsCache } from './oddsCache';
-import { orderBookCache, type SxOrderRecord } from './orderBookCache';
+import { orderBookCache, type BookLevel } from './orderBookCache';
 import { fixtureStateCache, type FixturePeriod } from './fixtureStateCache';
 import { seedAllFixtureState, seedFixtureStatuses } from './sxFixtureService';
 import { emitMarketUpsert, emitMarketRemoved } from './marketEvents';
 
 const log = createLogger('centrifugo');
 
-// USDC on Polygon — only process odds for this token
-const USDC_BASE_TOKEN = '0x6629Ce1Cf35Cc1329ebB4F63202F3f197b3F050B';
+// SX Bet V3 cutover (Aug 26, 2026) renamed the auth header, several endpoints,
+// and several realtime channels, and reshaped the order-book feed from
+// per-order deltas to a fully-aggregated replace-on-every-update model.
+// See https://docs.sx.bet/developers/migrate-to-v3 ("Realtime changes" and
+// "Re-model the order book feed" steps) for the source of every change below.
 
 const MAX_QUEUE = 1_000;
 const BOOK_UNSUBSCRIBE_GRACE_MS = 10_000;
 
-// Publications arrive as arrays; each entry has this shape per the SX Bet docs
+// Publications arrive as arrays; each entry has this shape per the SX Bet docs.
+// NOTE: not independently re-verified against a live best_odds_v3 payload —
+// the migration doc lists this endpoint/channel as a straight rename with no
+// field-level diff called out, unlike the order-book channel. If odds look
+// wrong after deploying this, this shape (and seedBestOdds below) is the
+// first place to check against a real payload.
 interface OddsPublication {
   baseToken: string;
   marketHash: string;
@@ -26,17 +34,14 @@ interface OddsPublication {
   updatedAt: number; // ms timestamp from the server
 }
 
-// Order book publications: arrays of order records
-interface OrderBookPublication {
-  orderHash: string;
+// V3 orderbook_v3 channel / snapshot shape — aggregated by price level,
+// maker-frame only on the WS channel (unlike the REST snapshot, which
+// supports showTakerPerspective). See adapters/sxbet.ts for the REST side.
+interface OrderbookV3Publication {
   marketHash: string;
-  baseToken: string;
-  status: 'ACTIVE' | 'INACTIVE' | 'FILLED';
-  totalBetSize: string;
-  fillAmount: string;
-  percentageOdds: string;
-  isMakerBettingOutcomeOne: boolean;
-  updateTime: number;
+  version: string;
+  outcomeOne: { percentageOdds: string; size: string }[];
+  outcomeTwo: { percentageOdds: string; size: string }[];
 }
 
 export function computeTakerOdds(percentageOdds: string): number {
@@ -45,6 +50,14 @@ export function computeTakerOdds(percentageOdds: string): number {
   const n = Number(percentageOdds);
   if (!Number.isFinite(n) || n <= 0) return 0;
   return parseFloat((1 - n / 1e20).toFixed(8));
+}
+
+/** Maker-frame levels (as published on orderbook_v3) → taker-frame BookLevel[], sorted best-first. */
+function makerLevelsToTakerLevels(levels: { percentageOdds: string; size: string }[]): BookLevel[] {
+  return levels
+    .map((l) => ({ odds: computeTakerOdds(l.percentageOdds), size: Number(l.size) / 1_000_000 }))
+    .filter((l) => l.odds > 0 && l.size > 0)
+    .sort((a, b) => a.odds - b.odds);
 }
 
 interface BestOddsRestEntry {
@@ -80,8 +93,8 @@ async function seedBestOdds(): Promise<void> {
   if (hashes.length === 0) return;
   for (let i = 0; i < hashes.length; i += SEED_BATCH_SIZE) {
     const batch = hashes.slice(i, i + SEED_BATCH_SIZE);
-    const url = `${config.SX_BET_API_URL}/orders/odds/best?marketHashes=${batch.join(',')}&baseToken=${USDC_BASE_TOKEN}`;
-    const res = await fetch(url, { headers: { 'x-api-key': config.SX_BET_API_KEY } });
+    const url = `${config.SX_BET_API_URL}/orders-v3/odds/best?marketHashes=${batch.join(',')}`;
+    const res = await fetch(url, { headers: { 'x-sx-api-key': config.SX_BET_API_KEY } });
     if (!res.ok) {
       log.error({ status: res.status }, 'best_odds REST seed failed');
       continue;
@@ -107,7 +120,7 @@ async function seedBestOdds(): Promise<void> {
 
 async function seedMarkets(): Promise<void> {
   const res = await fetch(`${config.SX_BET_API_URL}/markets/active`, {
-    headers: { 'x-api-key': config.SX_BET_API_KEY },
+    headers: { 'x-sx-api-key': config.SX_BET_API_KEY },
   });
   if (!res.ok) log.error({ status: res.status }, 'markets REST seed failed');
 }
@@ -115,30 +128,29 @@ async function seedMarkets(): Promise<void> {
 // In-flight dedupe so concurrent warmMarketBook callers share the same REST call.
 const bookSeedInflight = new Map<string, Promise<void>>();
 
-// REST seed for a single market's order book
+// REST seed for a single market's order book. Uses showTakerPerspective=true,
+// so — unlike the WS channel — this is already taker-frame and needs no
+// maker→taker inversion before handing to the cache.
 async function seedMarketBook(marketHash: string): Promise<void> {
-  const url = `${config.SX_BET_API_URL}/orders?marketHashes=${marketHash}&baseToken=${USDC_BASE_TOKEN}`;
-  const res = await fetch(url, { headers: { 'x-api-key': config.SX_BET_API_KEY } });
+  const url = `${config.SX_BET_API_URL}/orderbook-v3/snapshot?marketHash=${marketHash}&showTakerPerspective=true`;
+  const res = await fetch(url, { headers: { 'x-sx-api-key': config.SX_BET_API_KEY } });
   if (!res.ok) {
-    log.error({ marketHash, status: res.status }, 'order_book REST seed failed');
+    log.error({ marketHash, status: res.status }, 'orderbook-v3 snapshot seed failed');
     return;
   }
-  const body = (await res.json()) as { data: OrderBookPublication[] };
-  const records: SxOrderRecord[] = [];
-  for (const o of body.data ?? []) {
-    if (o.baseToken && o.baseToken !== USDC_BASE_TOKEN) continue;
-    records.push({
-      orderHash: o.orderHash,
-      marketHash: o.marketHash,
-      status: 'ACTIVE',
-      totalBetSize: o.totalBetSize,
-      fillAmount: o.fillAmount,
-      percentageOdds: o.percentageOdds,
-      isMakerBettingOutcomeOne: o.isMakerBettingOutcomeOne,
-      updateTime: o.updateTime ?? Date.now(),
-    });
-  }
-  orderBookCache.replaceMarket(marketHash, records);
+  const body = (await res.json()) as {
+    data: { outcomeOne: { percentageOdds: string; size: string }[]; outcomeTwo: { percentageOdds: string; size: string }[] };
+  };
+  const toLevels = (arr: { percentageOdds: string; size: string }[]): BookLevel[] =>
+    arr
+      .map((l) => ({ odds: Number(l.percentageOdds) / 1e20, size: Number(l.size) / 1_000_000 }))
+      .filter((l) => l.odds > 0 && l.size > 0);
+
+  orderBookCache.setBook(
+    marketHash,
+    { outcomeOne: toLevels(body.data.outcomeOne), outcomeTwo: toLevels(body.data.outcomeTwo) },
+    null, // REST seed — always applies, not version-gated against WS state
+  );
 }
 
 /**
@@ -186,7 +198,7 @@ export function subscribeToMarketBook(marketHash: string): void {
     return;
   }
 
-  const channel = `order_book:market_${marketHash}`;
+  const channel = `orderbook_v3:${marketHash}`;
   const sub = centrifugoClient.newSubscription(channel, {
     positioned: true,
     recoverable: true,
@@ -202,23 +214,21 @@ export function subscribeToMarketBook(marketHash: string): void {
   });
 
   sub.on('publication', (ctx) => {
-    const batch = ctx.data as OrderBookPublication[];
-    if (!Array.isArray(batch)) return;
-    const records: SxOrderRecord[] = [];
-    for (const o of batch) {
-      if (o.baseToken && o.baseToken !== USDC_BASE_TOKEN) continue;
-      records.push({
-        orderHash: o.orderHash,
-        marketHash: o.marketHash,
-        status: o.status,
-        totalBetSize: o.totalBetSize,
-        fillAmount: o.fillAmount,
-        percentageOdds: o.percentageOdds,
-        isMakerBettingOutcomeOne: o.isMakerBettingOutcomeOne,
-        updateTime: o.updateTime ?? Date.now(),
-      });
-    }
-    orderBookCache.applyBatch(marketHash, records);
+    // V3: the channel publishes the ENTIRE book (aggregated by price level,
+    // maker-frame) on every update — replace, don't merge, and only apply if
+    // strictly newer than what we hold. orderBookCache.setBook enforces the
+    // version check; we just do the maker→taker inversion and side-swap here
+    // (maker betting outcomeOne == fillable by a taker who wants outcomeTwo).
+    const pub = ctx.data as OrderbookV3Publication;
+    if (!pub || typeof pub.marketHash !== 'string') return;
+    orderBookCache.setBook(
+      pub.marketHash,
+      {
+        outcomeOne: makerLevelsToTakerLevels(pub.outcomeTwo ?? []),
+        outcomeTwo: makerLevelsToTakerLevels(pub.outcomeOne ?? []),
+      },
+      pub.version,
+    );
   });
 
   sub.on('unsubscribed', (ctx) => {
@@ -260,10 +270,6 @@ export function startCentrifugoService(): void {
   function applyBatch(batch: OddsPublication[]): void {
     for (const item of batch) {
       log.trace({ marketHash: item.marketHash, isMakerOne: item.isMakerBettingOutcomeOne, baseToken: item.baseToken, pct: item.percentageOdds, ts: item.updatedAt }, 'best_odds publication');
-      if (item.baseToken !== USDC_BASE_TOKEN) {
-        log.trace({ marketHash: item.marketHash, baseToken: item.baseToken }, 'best_odds dropped: baseToken mismatch');
-        continue;
-      }
       oddsCache.set({
         marketHash: item.marketHash,
         isMakerBettingOutcomeOne: item.isMakerBettingOutcomeOne,
@@ -301,11 +307,11 @@ export function startCentrifugoService(): void {
   const client = new Centrifuge(config.SX_BET_WS_URL, {
     websocket: WebSocket as unknown as typeof globalThis.WebSocket,
     getToken: async () => {
-      const res = await fetch(`${config.SX_BET_API_URL}/user/realtime-token/api-key`, {
-        headers: { 'x-api-key': config.SX_BET_API_KEY },
+      const res = await fetch(`${config.SX_BET_API_URL}/user/realtime-token-v3/api-key`, {
+        headers: { 'x-sx-api-key': config.SX_BET_API_KEY },
       });
       if (res.status === 401) {
-        log.error('auth failed — check SX_BET_API_KEY');
+        log.error('auth failed — check SX_BET_API_KEY is a V3 key (V2 keys stopped working at the Aug 26 cutover)');
         throw new Error('auth_failed');
       }
       if (!res.ok) throw new Error(`token fetch failed: ${res.status}`);
@@ -321,11 +327,11 @@ export function startCentrifugoService(): void {
     setTimeout(() => client.connect(), 5_000);
   });
 
-  // best_odds:global — no history, always re-seed on every subscribe
-  const bestOddsSub = client.newSubscription('best_odds:global');
+  // best_odds_v3:global — no history, always re-seed on every subscribe
+  const bestOddsSub = client.newSubscription('best_odds_v3:global');
 
   bestOddsSub.on('subscribed', () => {
-    log.info({ channel: 'best_odds:global' }, 'subscribed');
+    log.info({ channel: 'best_odds_v3:global' }, 'subscribed');
     seedBestOdds().catch((err) => log.error({ err }, 'best_odds seed failed'));
   });
 
@@ -334,7 +340,7 @@ export function startCentrifugoService(): void {
   });
 
   bestOddsSub.on('unsubscribed', (ctx) => {
-    log.warn({ channel: 'best_odds:global', code: ctx.code }, 'unsubscribed, resubscribing');
+    log.warn({ channel: 'best_odds_v3:global', code: ctx.code }, 'unsubscribed, resubscribing');
     bestOddsSub.subscribe();
   });
 

@@ -14,7 +14,7 @@
  * ascending-by-odds ladder so the panel shows cross-venue depth like the full
  * app. Either pointer may be omitted.
  */
-import { fetchOrdersForHashes, buildOutcome } from '../adapters/sxbet';
+import { fetchOrderbookSnapshot, levelsFromSnapshotSide, buildOutcome } from '../adapters/sxbet';
 import { fetchClobBook, buildOutcomeFromBook, SPORTS_FEE_RATE } from '../adapters/polymarket';
 
 export interface PublicOrderBookLevel {
@@ -37,9 +37,12 @@ async function sxSideLevels(
   const idx = sxPointer.lastIndexOf(':');
   const hash = idx === -1 ? sxPointer : sxPointer.slice(0, idx);
   const side: 0 | 1 = sxPointer.slice(idx + 1) === '1' ? 1 : 0;
-  const orders = await fetchOrdersForHashes([hash]);
-  // side 0 → taker bets outcomeOne; side 1 → taker bets outcomeTwo.
-  const outcome = buildOutcome('', orders, side === 0);
+  const snapshot = await fetchOrderbookSnapshot(hash);
+  // side 0 → taker bets outcomeOne; side 1 → taker bets outcomeTwo. V3's
+  // snapshot (showTakerPerspective=true) already hands back each side in the
+  // taker's own frame, so no maker→taker inversion needed here.
+  const rawLevels = snapshot ? (side === 0 ? snapshot.outcomeOne : snapshot.outcomeTwo) : [];
+  const outcome = buildOutcome('', levelsFromSnapshotSide(rawLevels));
   return {
     levels: outcome.liquidityDepth.topLevels.map((l) => ({ odds: l.odds, size: l.size, platform: 'sx' as const })),
     hash,

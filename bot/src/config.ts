@@ -37,8 +37,16 @@ if (!parsed.success) {
   const missing = parsed.error.issues
     .map((i) => `  - ${i.path.join('.')}: ${i.message}`)
     .join('\n');
-  console.error(`[config] Missing or invalid environment variables:\n${missing}`);
-  process.exit(1);
+  const message = `[config] Missing or invalid environment variables:\n${missing}`;
+  console.error(message);
+  // Deliberately `throw` here, not `process.exit(1)`. In the full bot (a
+  // long-running process) an unhandled throw at startup crashes it anyway —
+  // same effective fail-fast behavior. But this file is also imported by the
+  // read-only Vercel serverless function (via bot/src/adapters/*), where
+  // process.exit(1) kills the entire lambda with a bare "Serverless Function
+  // has crashed" page and no detail. A thrown Error at least gets this exact
+  // message into Vercel's function logs instead of just a generic crash.
+  throw new Error(message);
 }
 
 export const config = parsed.data;

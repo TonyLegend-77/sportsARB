@@ -44,11 +44,11 @@ function sleep(ms: number): Promise<void> {
 
 async function fetchSx<T>(path: string): Promise<T | null> {
   const url = `${config.SX_BET_API_URL}${path}`;
-  let res = await fetch(url, { headers: { 'x-api-key': config.SX_BET_API_KEY } });
+  let res = await fetch(url, { headers: { 'x-sx-api-key': config.SX_BET_API_KEY } });
   if (res.status === 429) {
     log.warn({ path }, 'rate limited, retrying in 10s');
     await sleep(RATE_LIMIT_DELAY_MS);
-    res = await fetch(url, { headers: { 'x-api-key': config.SX_BET_API_KEY } });
+    res = await fetch(url, { headers: { 'x-sx-api-key': config.SX_BET_API_KEY } });
   }
   if (!res.ok) {
     log.error({ path, status: res.status }, 'request failed');

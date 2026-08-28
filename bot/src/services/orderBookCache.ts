@@ -1,24 +1,10 @@
 import { EventEmitter } from 'events';
 import { prisma } from '../db';
 
-const ODDS_PRECISION = BigInt('100000000000000000000'); // 10^20
-const USDC_DECIMALS = 1_000_000;
-
 const DEFAULT_TOP_LEVELS = 10;
 const MIN_TOP_LEVELS = 3;
 const MAX_TOP_LEVELS = 25;
 const CONFIG_CACHE_MS = 5_000;
-
-export interface SxOrderRecord {
-  orderHash: string;
-  marketHash: string;
-  status: 'ACTIVE' | 'INACTIVE' | 'FILLED';
-  totalBetSize: string; // maker USDC units (6 decimals)
-  fillAmount: string;
-  percentageOdds: string; // 10^20 scale, maker implied
-  isMakerBettingOutcomeOne: boolean;
-  updateTime: number;
-}
 
 export interface BookLevel {
   odds: number; // taker implied probability
@@ -30,40 +16,29 @@ export interface BookSides {
   outcomeTwo: BookLevel[]; // for taker betting outcomeTwo
 }
 
-function deriveLevels(orders: Iterable<SxOrderRecord>, topN: number): BookSides {
-  const oneMap = new Map<number, number>(); // taker bets outcomeOne
-  const twoMap = new Map<number, number>(); // taker bets outcomeTwo
-
-  for (const o of orders) {
-    const makerRemaining = BigInt(o.totalBetSize) - BigInt(o.fillAmount);
-    if (makerRemaining <= 0n) continue;
-
-    const pctOdds = BigInt(o.percentageOdds);
-    if (pctOdds <= 0n) continue;
-
-    const takerSpace = (makerRemaining * ODDS_PRECISION) / pctOdds - makerRemaining;
-    const takerUsdc = Number(takerSpace) / USDC_DECIMALS;
-    if (takerUsdc <= 0) continue;
-
-    const makerImplied = Number(o.percentageOdds) / 1e20;
-    const takerOdds = parseFloat((1 - makerImplied).toFixed(8));
-
-    // Maker on outcomeOne → taker bets outcomeTwo (twoMap). And vice versa.
-    const target = o.isMakerBettingOutcomeOne ? twoMap : oneMap;
-    target.set(takerOdds, (target.get(takerOdds) ?? 0) + takerUsdc);
-  }
-
-  const toLevels = (m: Map<number, number>): BookLevel[] =>
-    Array.from(m.entries())
-      .map(([odds, size]) => ({ odds, size }))
-      .sort((a, b) => a.odds - b.odds)
-      .slice(0, topN);
-
-  return { outcomeOne: toLevels(oneMap), outcomeTwo: toLevels(twoMap) };
+interface StoredBook extends BookSides {
+  version: string | null; // null = seeded via REST, no version to gate on
 }
 
+/**
+ * V3 change from the old per-order-delta model: the orderbook_v3 WS channel
+ * (and the orderbook-v3/snapshot REST endpoint) both hand back the FULL book
+ * already aggregated by price level, every time — "replace, don't merge." So
+ * this cache just stores whatever levels it was last given per market; there
+ * is no more per-orderHash bookkeeping or manual price-bucketing here.
+ *
+ * Callers (centrifugo.ts) are responsible for the maker→taker inversion when
+ * feeding WS publications (the orderbook_v3 channel is maker-frame only) —
+ * this cache always stores already-taker-frame levels, both from WS and from
+ * the REST seed (which uses showTakerPerspective=true and needs no inversion).
+ *
+ * `version` gating: WS publications carry a monotonic version string and
+ * must only be applied if strictly greater than the one already held, per
+ * https://docs.sx.bet/developers/book-versioning. REST seeds don't compete
+ * with this — pass version=null for a seed and it always applies.
+ */
 export class OrderBookCache extends EventEmitter {
-  private books = new Map<string, Map<string, SxOrderRecord>>();
+  private books = new Map<string, StoredBook>();
   private topLevels = DEFAULT_TOP_LEVELS;
   private configFetchedAt = 0;
   private configInflight: Promise<void> | null = null;
@@ -97,40 +72,21 @@ export class OrderBookCache extends EventEmitter {
     return this.topLevels;
   }
 
-  private getOrCreateBook(marketHash: string): Map<string, SxOrderRecord> {
-    let book = this.books.get(marketHash);
-    if (!book) {
-      book = new Map();
-      this.books.set(marketHash, book);
+  /**
+   * Set the full book for a market. `version`: pass the WS publication's
+   * version string for live updates (skipped if not strictly greater than
+   * what's held), or null for a REST seed (always applied).
+   */
+  setBook(marketHash: string, sides: BookSides, version: string | null): void {
+    const held = this.books.get(marketHash);
+    if (version !== null && held?.version != null && version <= held.version) {
+      return; // stale WS publication — ignore per the version-gating rule
     }
-    return book;
-  }
 
-  replaceMarket(marketHash: string, records: SxOrderRecord[]): void {
-    const book = new Map<string, SxOrderRecord>();
-    for (const r of records) {
-      if (r.status === 'ACTIVE') book.set(r.orderHash, r);
-    }
-    this.books.set(marketHash, book);
-    void this.refreshTopLevels();
-    this.emitUpdate(marketHash);
-  }
+    const sortedOne = [...sides.outcomeOne].sort((a, b) => a.odds - b.odds).slice(0, this.topLevels);
+    const sortedTwo = [...sides.outcomeTwo].sort((a, b) => a.odds - b.odds).slice(0, this.topLevels);
 
-  applyBatch(marketHash: string, records: SxOrderRecord[]): void {
-    if (records.length === 0) return;
-    const book = this.getOrCreateBook(marketHash);
-    let changed = false;
-    for (const r of records) {
-      const existing = book.get(r.orderHash);
-      if (existing && existing.updateTime > r.updateTime) continue;
-      if (r.status === 'ACTIVE') {
-        book.set(r.orderHash, r);
-        changed = true;
-      } else {
-        if (book.delete(r.orderHash)) changed = true;
-      }
-    }
-    if (!changed) return;
+    this.books.set(marketHash, { outcomeOne: sortedOne, outcomeTwo: sortedTwo, version });
     void this.refreshTopLevels();
     this.emitUpdate(marketHash);
   }
@@ -142,7 +98,7 @@ export class OrderBookCache extends EventEmitter {
   getLevels(marketHash: string): BookSides {
     const book = this.books.get(marketHash);
     if (!book) return { outcomeOne: [], outcomeTwo: [] };
-    return deriveLevels(book.values(), this.topLevels);
+    return { outcomeOne: book.outcomeOne.slice(0, this.topLevels), outcomeTwo: book.outcomeTwo.slice(0, this.topLevels) };
   }
 
   private emitUpdate(marketHash: string): void {

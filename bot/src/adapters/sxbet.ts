@@ -6,12 +6,9 @@ import { createLogger } from '../logger';
 
 const log = createLogger('sxbet');
 
-const BASE_TOKEN = '0x6629Ce1Cf35Cc1329ebB4F63202F3f197b3F050B';
-const ODDS_PRECISION = BigInt('100000000000000000000'); // 10^20
-const USDC_DECIMALS = 1_000_000;
 const TOP_LEVELS = 5;
-const ORDER_BATCH_SIZE = 30;
-const BATCH_DELAY_MS = 600;
+const SNAPSHOT_BATCH_SIZE = 20; // concurrent snapshot fetches per round
+const BATCH_DELAY_MS = 300;
 
 interface SxMarket {
   marketHash: string;
@@ -29,24 +26,26 @@ interface SxMarket {
   gameTime: number; // UNIX timestamp (seconds)
 }
 
-interface SxOrder {
-  marketHash: string;
-  percentageOdds: string;
-  totalBetSize: string;
-  fillAmount: string;
-  isMakerBettingOutcomeOne: boolean;
-}
-
 // One entry per game — holds the three 1X2 binary markets
 interface GameEntry {
-  homeTeam: string;       // canonical
-  awayTeam: string;       // canonical
+  homeTeam: string; // canonical
+  awayTeam: string; // canonical
   gameTime: number;
   sportLabel: string;
-  sxEventId?: string;     // sportXeventId shared across all bet types for this game
+  sxEventId?: string; // sportXeventId shared across all bet types for this game
   homeWinMarket?: SxMarket; // outcomeOneName === teamOneName
-  drawMarket?: SxMarket;    // outcomeOneName === 'Tie'
+  drawMarket?: SxMarket; // outcomeOneName === 'Tie'
   awayWinMarket?: SxMarket; // outcomeOneName === teamTwoName
+}
+
+interface SnapshotLevel {
+  percentageOdds: string;
+  size: string;
+}
+
+interface OrderbookSnapshot {
+  outcomeOne: SnapshotLevel[];
+  outcomeTwo: SnapshotLevel[];
 }
 
 function sleep(ms: number): Promise<void> {
@@ -88,50 +87,64 @@ async function fetchAllActiveMarkets(leagueId: number): Promise<SxMarket[]> {
   return markets;
 }
 
-export async function fetchOrdersForHashes(hashes: string[]): Promise<SxOrder[]> {
-  const params = new URLSearchParams({
-    marketHashes: hashes.join(','),
-    baseToken: BASE_TOKEN,
-  });
-  const url = `${config.SX_BET_API_URL}/orders?${params}`;
+/**
+ * V3: GET /orderbook-v3/snapshot with showTakerPerspective=true returns
+ * outcomeOne/outcomeTwo already in the TAKER's own frame — no more manual
+ * maker→taker inversion or per-order bucketing (that used to happen in
+ * buildOutcome against raw GET /orders rows, which no longer exists as a
+ * public market-wide endpoint post-V3).
+ */
+async function fetchOrderbookSnapshot(marketHash: string): Promise<OrderbookSnapshot | null> {
+  const url = `${config.SX_BET_API_URL}/orderbook-v3/snapshot?marketHash=${marketHash}&showTakerPerspective=true`;
   const res = await fetchWithRetry(url);
-  if (!res.ok) throw new Error(`GET /orders returned ${res.status}`);
-  const body = (await res.json()) as { data: SxOrder[] };
+  if (!res.ok) {
+    log.error({ marketHash, status: res.status }, 'orderbook-v3 snapshot fetch failed');
+    return null;
+  }
+  const body = (await res.json()) as { data: OrderbookSnapshot };
   return body.data;
 }
 
-export function buildOutcome(
-  label: string,
-  orders: SxOrder[],
-  // takerBettingOutcomeOne=true means taker bets outcomeOne (needs makers on outcomeTwo)
-  takerBettingOutcomeOne: boolean,
-): OutcomeOdds {
-  const relevantOrders = orders.filter(
-    (o) => o.isMakerBettingOutcomeOne !== takerBettingOutcomeOne,
-  );
-
-  const levelMap = new Map<number, number>();
-  let totalAvailableUsdc = 0;
-
-  for (const o of relevantOrders) {
-    const makerRemaining = BigInt(o.totalBetSize) - BigInt(o.fillAmount);
-    if (makerRemaining <= 0n) continue;
-
-    const takerSpace = (makerRemaining * ODDS_PRECISION) / BigInt(o.percentageOdds) - makerRemaining;
-    const takerUsdc = Number(takerSpace) / USDC_DECIMALS;
-
-    const makerImplied = parseFloat(o.percentageOdds) / 1e20;
-    const takerOdds = parseFloat((1 - makerImplied).toFixed(8));
-
-    levelMap.set(takerOdds, (levelMap.get(takerOdds) ?? 0) + takerUsdc);
-    totalAvailableUsdc += takerUsdc;
+async function fetchSnapshotsForHashes(hashes: string[]): Promise<Map<string, OrderbookSnapshot>> {
+  const out = new Map<string, OrderbookSnapshot>();
+  for (let i = 0; i < hashes.length; i += SNAPSHOT_BATCH_SIZE) {
+    const batch = hashes.slice(i, i + SNAPSHOT_BATCH_SIZE);
+    const results = await Promise.all(
+      batch.map(async (hash) => [hash, await fetchOrderbookSnapshot(hash)] as const),
+    );
+    for (const [hash, snapshot] of results) {
+      if (snapshot) out.set(hash, snapshot);
+    }
+    if (i + SNAPSHOT_BATCH_SIZE < hashes.length) {
+      await sleep(BATCH_DELAY_MS);
+    }
   }
+  return out;
+}
 
-  const topLevels = Array.from(levelMap.entries())
-    .map(([odds, size]) => ({ odds, size }))
-    .sort((a, b) => a.odds - b.odds)  // ascending: lowest implied probability (best payout) first
-    .slice(0, TOP_LEVELS);
+function levelsFromSnapshot(levels: SnapshotLevel[]): { odds: number; size: number }[] {
+  return levels
+    .map((l) => ({
+      odds: parseFloat((Number(l.percentageOdds) / 1e20).toFixed(8)),
+      size: Number(l.size) / 1_000_000,
+    }))
+    .filter((l) => l.odds > 0 && l.odds < 1 && l.size > 0);
+}
 
+export function levelsFromSnapshotSide(levels: SnapshotLevel[]): { odds: number; size: number }[] {
+  return levelsFromSnapshot(levels);
+}
+
+export { fetchOrderbookSnapshot };
+
+/**
+ * label: the outcome's display name.
+ * levels: already taker-frame, already sorted best-first per the API (index 0
+ * = best price) — this function just slices/summarizes, it does no odds math.
+ */
+export function buildOutcome(label: string, levels: { odds: number; size: number }[]): OutcomeOdds {
+  const topLevels = levels.slice(0, TOP_LEVELS);
+  const totalAvailableUsdc = levels.reduce((sum, l) => sum + l.size, 0);
   const bestOdds = topLevels[0]?.odds ?? 0;
 
   return {
@@ -139,6 +152,10 @@ export function buildOutcome(
     impliedOdds: bestOdds,
     liquidityDepth: { availableSize: totalAvailableUsdc, topLevels },
   };
+}
+
+function emptyOutcome(label: string): OutcomeOdds {
+  return { label, impliedOdds: 0, liquidityDepth: { availableSize: 0, topLevels: [] } };
 }
 
 // Types 226/342/28 are the "Including Overtime" equivalents used by NBA/NHL
@@ -173,9 +190,9 @@ export async function fetchSxBetMarkets(league: LeagueConfig = ACTIVE_LEAGUE): P
     return [];
   }
 
-  const type1Markets = league.hasDraw ? allMarkets.filter(m => m.type === 1) : [];
+  const type1Markets = league.hasDraw ? allMarkets.filter((m) => m.type === 1) : [];
   const gameLinesMarkets = allMarkets.filter(
-    m => GAME_LINE_TYPES.has(m.type) && m.teamOneName && m.teamTwoName,
+    (m) => GAME_LINE_TYPES.has(m.type) && m.teamOneName && m.teamTwoName,
   );
 
   // Group the three 1X2 binary markets (home win, draw, away win) by game.
@@ -221,28 +238,7 @@ export async function fetchSxBetMarkets(league: LeagueConfig = ACTIVE_LEAGUE): P
   }
   for (const m of gameLinesMarkets) allHashes.push(m.marketHash);
 
-  // Fetch orders in batches and index by marketHash
-  const ordersMap = new Map<string, SxOrder[]>();
-
-  for (let i = 0; i < allHashes.length; i += ORDER_BATCH_SIZE) {
-    const batch = allHashes.slice(i, i + ORDER_BATCH_SIZE);
-    const batchNum = Math.floor(i / ORDER_BATCH_SIZE) + 1;
-
-    try {
-      const orders = await fetchOrdersForHashes(batch);
-      for (const order of orders) {
-        const list = ordersMap.get(order.marketHash) ?? [];
-        list.push(order);
-        ordersMap.set(order.marketHash, list);
-      }
-    } catch (err) {
-      log.error({ err, batchNum }, 'failed to fetch orders batch');
-    }
-
-    if (i + ORDER_BATCH_SIZE < allHashes.length) {
-      await sleep(BATCH_DELAY_MS);
-    }
-  }
+  const snapshots = await fetchSnapshotsForHashes(allHashes);
 
   const quotes: MarketQuote[] = [];
 
@@ -254,41 +250,36 @@ export async function fetchSxBetMarkets(league: LeagueConfig = ACTIVE_LEAGUE): P
     const name = `${entry.homeTeam} vs ${entry.awayTeam}`;
     const outcomes: OutcomeOdds[] = [];
 
-    // Outcome: Home Win — taker bets outcomeOne (the home team)
-    const homeOrders = ordersMap.get(entry.homeWinMarket.marketHash) ?? [];
-    const homeOut = buildOutcome(entry.homeTeam, homeOrders, true);
-    // externalId encodes which binary market hash to use when executing:
-    // format "${specificMarketHash}:0" means isTakerBettingOutcomeOne=true
+    // Home-win binary market: outcomeOne = home team, outcomeTwo = "not home"
+    const homeSnapshot = snapshots.get(entry.homeWinMarket.marketHash);
+    const homeOut = homeSnapshot ? buildOutcome(entry.homeTeam, levelsFromSnapshot(homeSnapshot.outcomeOne)) : emptyOutcome(entry.homeTeam);
     homeOut.externalId = `${entry.homeWinMarket.marketHash}:0`;
     outcomes.push(homeOut);
 
-    // Outcome: Not Home Win — taker bets outcomeTwo on the home-win binary
-    const notHomeOut = buildOutcome(`Not ${entry.homeTeam}`, homeOrders, false);
+    const notHomeOut = homeSnapshot ? buildOutcome(`Not ${entry.homeTeam}`, levelsFromSnapshot(homeSnapshot.outcomeTwo)) : emptyOutcome(`Not ${entry.homeTeam}`);
     notHomeOut.externalId = `${entry.homeWinMarket.marketHash}:1`;
     outcomes.push(notHomeOut);
 
-    // Outcome: Draw — taker bets outcomeOne (Tie) on the draw binary
+    // Draw binary market: outcomeOne = Tie, outcomeTwo = "not draw"
     if (entry.drawMarket) {
-      const drawOrders = ordersMap.get(entry.drawMarket.marketHash) ?? [];
-      const drawOut = buildOutcome('Draw', drawOrders, true);
+      const drawSnapshot = snapshots.get(entry.drawMarket.marketHash);
+      const drawOut = drawSnapshot ? buildOutcome('Draw', levelsFromSnapshot(drawSnapshot.outcomeOne)) : emptyOutcome('Draw');
       drawOut.externalId = `${entry.drawMarket.marketHash}:0`;
       outcomes.push(drawOut);
 
-      // Outcome: Not Draw — taker bets outcomeTwo on the draw binary
-      const notDrawOut = buildOutcome('Not Draw', drawOrders, false);
+      const notDrawOut = drawSnapshot ? buildOutcome('Not Draw', levelsFromSnapshot(drawSnapshot.outcomeTwo)) : emptyOutcome('Not Draw');
       notDrawOut.externalId = `${entry.drawMarket.marketHash}:1`;
       outcomes.push(notDrawOut);
     }
 
-    // Outcome: Away Win — taker bets outcomeOne (away team) on the away-win binary
+    // Away-win binary market: outcomeOne = away team, outcomeTwo = "not away"
     if (entry.awayWinMarket) {
-      const awayOrders = ordersMap.get(entry.awayWinMarket.marketHash) ?? [];
-      const awayOut = buildOutcome(entry.awayTeam, awayOrders, true);
+      const awaySnapshot = snapshots.get(entry.awayWinMarket.marketHash);
+      const awayOut = awaySnapshot ? buildOutcome(entry.awayTeam, levelsFromSnapshot(awaySnapshot.outcomeOne)) : emptyOutcome(entry.awayTeam);
       awayOut.externalId = `${entry.awayWinMarket.marketHash}:0`;
       outcomes.push(awayOut);
 
-      // Outcome: Not Away Win — taker bets outcomeTwo on the away-win binary
-      const notAwayOut = buildOutcome(`Not ${entry.awayTeam}`, awayOrders, false);
+      const notAwayOut = awaySnapshot ? buildOutcome(`Not ${entry.awayTeam}`, levelsFromSnapshot(awaySnapshot.outcomeTwo)) : emptyOutcome(`Not ${entry.awayTeam}`);
       notAwayOut.externalId = `${entry.awayWinMarket.marketHash}:1`;
       outcomes.push(notAwayOut);
     }
@@ -319,15 +310,15 @@ export async function fetchSxBetMarkets(league: LeagueConfig = ACTIVE_LEAGUE): P
 
     const homeTeam = canonicalTeamName(rawHome, league.sport);
     const awayTeam = canonicalTeamName(rawAway, league.sport);
-    const orders = ordersMap.get(market.marketHash) ?? [];
+    const snapshot = snapshots.get(market.marketHash);
 
     const labelOne = canonicalizeOutcomeLabel(market.outcomeOneName, rawHome, rawAway, homeTeam, awayTeam);
     const labelTwo = canonicalizeOutcomeLabel(market.outcomeTwoName, rawHome, rawAway, homeTeam, awayTeam);
 
-    const outcomeOne = buildOutcome(labelOne, orders, true);
+    const outcomeOne = snapshot ? buildOutcome(labelOne, levelsFromSnapshot(snapshot.outcomeOne)) : emptyOutcome(labelOne);
     outcomeOne.externalId = `${market.marketHash}:0`;
 
-    const outcomeTwo = buildOutcome(labelTwo, orders, false);
+    const outcomeTwo = snapshot ? buildOutcome(labelTwo, levelsFromSnapshot(snapshot.outcomeTwo)) : emptyOutcome(labelTwo);
     outcomeTwo.externalId = `${market.marketHash}:1`;
 
     quotes.push({
@@ -347,7 +338,7 @@ export async function fetchSxBetMarkets(league: LeagueConfig = ACTIVE_LEAGUE): P
     });
   }
 
-  const glCount = quotes.filter(q => q.betType !== '1x2').length;
+  const glCount = quotes.filter((q) => q.betType !== '1x2').length;
   log.info(
     { league: league.name, total: quotes.length, oneXTwo: quotes.length - glCount, gameLines: glCount, sourceMarkets: allMarkets.length },
     'fetched quotes',

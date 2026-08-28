@@ -194,8 +194,8 @@ describe('startCentrifugoService', () => {
     await new Promise<void>((resolve) => setTimeout(resolve, 20));
 
     expect(seedFetch).toHaveBeenCalledWith(
-      expect.stringContaining('/orders/odds/best'),
-      expect.objectContaining({ headers: expect.objectContaining({ 'x-api-key': 'test-key' }) }),
+      expect.stringContaining('/orders-v3/odds/best'),
+      expect.objectContaining({ headers: expect.objectContaining({ 'x-sx-api-key': 'test-key' }) }),
     );
   });
 
