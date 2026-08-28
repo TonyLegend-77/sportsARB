@@ -3,12 +3,13 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "ts-node-dev --respawn --transpile-only src/index.ts",
-    "build": "tsc",
+    "dev": "prisma generate && ts-node-dev --respawn --transpile-only src/index.ts",
+    "build": "prisma generate && tsc",
+    "postinstall": "prisma generate",
     "test": "vitest run",
     "test:watch": "vitest",
     "lint": "eslint src --ext .ts",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "prisma generate && tsc --noEmit",
     "sync-teams": "ts-node --project tsconfig.scripts.json --transpile-only scripts/syncTeamNames.ts",
     "dryrun-canonicalize": "ts-node --project tsconfig.scripts.json --transpile-only scripts/dryrunCanonicalize.ts"
   },
