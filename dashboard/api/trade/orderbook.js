@@ -65,9 +65,10 @@ var envSchema = import_zod.z.object({
 var parsed = envSchema.safeParse(process.env);
 if (!parsed.success) {
   const missing = parsed.error.issues.map((i) => `  - ${i.path.join(".")}: ${i.message}`).join("\n");
-  console.error(`[config] Missing or invalid environment variables:
-${missing}`);
-  process.exit(1);
+  const message = `[config] Missing or invalid environment variables:
+${missing}`;
+  console.error(message);
+  throw new Error(message);
 }
 var config = parsed.data;
 
