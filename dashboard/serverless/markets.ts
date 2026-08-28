@@ -15,8 +15,6 @@
  * Requires env vars on the Vercel project (see api/README.md):
  *   READ_ONLY_MODE=true, SX_BET_API_KEY=<any>, DATABASE_URL=<any>
  */
-import { fetchPublicMarkets } from '../../bot/src/public/fetchMarkets';
-
 interface ResponseLike {
   setHeader(key: string, value: string): void;
   status(code: number): ResponseLike;
@@ -25,11 +23,22 @@ interface ResponseLike {
 
 export default async function handler(_req: unknown, res: ResponseLike): Promise<void> {
   try {
+    // Dynamic import, not a static top-level one, deliberately. A static
+    // `import` resolves (and can throw, e.g. config.ts's env validation)
+    // during Vercel's cold-start module load, which happens BEFORE this
+    // function body runs — that kind of throw bypasses this try/catch
+    // entirely and shows up as a bare "Serverless Function has crashed"
+    // page with no detail. Importing here means a cold-start failure is
+    // caught like any other error and comes back as readable JSON instead.
+    const { fetchPublicMarkets } = await import('../../bot/src/public/fetchMarkets');
     const markets = await fetchPublicMarkets();
     res.setHeader('Cache-Control', 'public, s-maxage=60, stale-while-revalidate=300');
     res.status(200).json(markets);
   } catch (err) {
     console.error('[api/markets] fetch failed', err);
-    res.status(500).json({ error: 'internal_server_error' });
+    res.status(500).json({
+      error: 'internal_server_error',
+      detail: err instanceof Error ? err.message : String(err),
+    });
   }
 }

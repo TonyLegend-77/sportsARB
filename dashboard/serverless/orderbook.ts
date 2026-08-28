@@ -14,8 +14,6 @@
  * never touches the DB and platform book reads need no key. Books move fast, so
  * the edge cache is shorter than the markets list.
  */
-import { fetchPublicOrderBook } from '../../bot/src/public/fetchOrderBook';
-
 interface RequestLike {
   url?: string;
 }
@@ -36,11 +34,16 @@ export default async function handler(req: RequestLike, res: ResponseLike): Prom
       return;
     }
 
+    // Dynamic import — see markets.ts for why (catches cold-start throws too).
+    const { fetchPublicOrderBook } = await import('../../bot/src/public/fetchOrderBook');
     const book = await fetchPublicOrderBook({ sx, poly });
     res.setHeader('Cache-Control', 'public, s-maxage=10, stale-while-revalidate=20');
     res.status(200).json(book);
   } catch (err) {
     console.error('[api/trade/orderbook] fetch failed', err);
-    res.status(500).json({ error: 'internal_server_error' });
+    res.status(500).json({
+      error: 'internal_server_error',
+      detail: err instanceof Error ? err.message : String(err),
+    });
   }
 }
