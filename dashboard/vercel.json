@@ -3,7 +3,8 @@
   "installCommand": "cd .. && npm install",
   "functions": {
     "api/markets.js": { "maxDuration": 60 },
-    "api/trade/orderbook.js": { "maxDuration": 30 }
+    "api/trade/orderbook.js": { "maxDuration": 30 },
+    "api/stats/markets.js": { "maxDuration": 15 }
   },
   "rewrites": [
     { "source": "/((?!api/).*)", "destination": "/index.html" }
