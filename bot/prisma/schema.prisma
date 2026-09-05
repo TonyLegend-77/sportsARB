@@ -93,6 +93,7 @@ model Trade {
   txHash        String?
   status        String   // "pending" | "filled" | "failed"
   failureReason String?
+  arbGroupId    String?  // set on both legs of an arb execution, null for regular trades
   market        Market   @relation(fields: [marketId], references: [id])
   outcome       Outcome  @relation(fields: [outcomeId], references: [id])
 }
