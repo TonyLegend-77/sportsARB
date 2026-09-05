@@ -29,6 +29,10 @@ const envSchema = z.object({
   SX_NETWORK_RPC_URL: z.string().url().default('https://rpc-rollup.sx.technology'),
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent']).default('info'),
   PUBLIC_PORT: z.string().optional(),
+  // Arb scanner tick rate. Mode (off/manual/auto) and dollar caps are
+  // runtime-toggleable via BotConfig (see arb/config.ts) — this one env var
+  // is the only arb setting that requires a restart to change.
+  ARB_SCAN_INTERVAL_MS: z.string().default('8000'),
 });
 
 const parsed = envSchema.safeParse(process.env);

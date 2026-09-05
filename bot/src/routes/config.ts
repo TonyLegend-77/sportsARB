@@ -34,6 +34,25 @@ router.put('/api/config/:key', async (req: Request, res: Response) => {
     }
   }
 
+  if (key === 'arbMode') {
+    if (value !== 'off' && value !== 'manual' && value !== 'auto') {
+      res.status(400).json({ error: 'arbMode must be one of: off, manual, auto' });
+      return;
+    }
+  }
+
+  if (key === 'arbMinMarginPct' || key === 'arbMaxStakeUsd' || key === 'arbDailyCapUsd') {
+    const parsed = parseFloat(value);
+    if (isNaN(parsed) || parsed <= 0) {
+      res.status(400).json({ error: `${key} must be a positive number` });
+      return;
+    }
+    if (key === 'arbMaxStakeUsd' && parsed > 5000) {
+      res.status(400).json({ error: 'arbMaxStakeUsd capped at 5000 as a sanity limit — raise this in code if you really mean it' });
+      return;
+    }
+  }
+
   try {
     const row = await prisma.botConfig.upsert({
       where: { key },

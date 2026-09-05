@@ -18,6 +18,8 @@ import { buildGameScreen, buildGame1x2Screen, buildGameLinesScreen, buildSpreadL
 import { registerLiveScreen, clearLiveScreen, startLiveScreenUpdater } from './liveScreens';
 import type { Allocation } from '../types';
 import { createLogger } from '../logger';
+import { getArbSettings, setArbMode, getArbDailySpent } from '../arb/config';
+import { getScannerStatus, getPendingConfirmation, discardPendingConfirmation, executeOpportunity } from '../arb/scanner';
 
 const log = createLogger('telegram');
 
@@ -63,6 +65,43 @@ export function startTelegramBot(): void {
   });
 
   bot.command('status', handleStatus);
+
+  bot.command('arbon', async (ctx) => {
+    await setArbMode('auto');
+    await ctx.reply('⚡ Arb mode: <b>AUTO</b> — opportunities above your min margin will execute immediately, within your daily and per-trade caps. Use /arbstatus to check limits or /arboff to pause.', { parse_mode: 'HTML' });
+  });
+
+  bot.command('arbmanual', async (ctx) => {
+    await setArbMode('manual');
+    await ctx.reply("⚡ Arb mode: <b>MANUAL</b> — you'll get a confirm/skip prompt for each opportunity, expiring after 25s.", { parse_mode: 'HTML' });
+  });
+
+  bot.command('arboff', async (ctx) => {
+    await setArbMode('off');
+    await ctx.reply('⏸ Arb mode: <b>OFF</b>. Scanner keeps running but will not alert or execute.', { parse_mode: 'HTML' });
+  });
+
+  bot.command('arbstatus', async (ctx) => {
+    const settings = await getArbSettings();
+    const dailySpent = await getArbDailySpent();
+    const scanner = getScannerStatus();
+    const lastTick = scanner.lastTickAt ? `${Math.round((Date.now() - scanner.lastTickAt) / 1000)}s ago` : 'never';
+
+    const text =
+      `<b>Arb Status</b>\n\n` +
+      `Mode: <b>${settings.mode.toUpperCase()}</b>\n` +
+      `Min margin: ${settings.minMarginPct}%\n` +
+      `Max stake/opportunity: $${settings.maxStakeUsd}\n` +
+      `Daily cap: $${settings.dailyCapUsd} (spent $${dailySpent.toFixed(2)} today)\n\n` +
+      `Last scan: ${lastTick}\n` +
+      `Opportunities last scan: ${scanner.lastTickOppCount}\n` +
+      `Pending confirmations: ${scanner.pendingConfirmations}\n` +
+      `In-flight: ${scanner.inFlight}\n\n` +
+      `/arbon · /arbmanual · /arboff\n` +
+      `Adjust caps: PUT /api/config/arbMinMarginPct (etc.) or via the dashboard.`;
+
+    await ctx.reply(text, { parse_mode: 'HTML' });
+  });
 
   bot.command('menu', async (ctx) => {
     clearLiveScreen(ctx.chat.id);
@@ -409,6 +448,33 @@ export function startTelegramBot(): void {
           `${statusEmoji} <b>${statusLabel}</b>\n\n${resultLines}`,
           resultKb,
         );
+        return;
+      }
+
+      // arbexec:<opportunityId> — manual-mode confirm tap
+      if (data.startsWith('arbexec:')) {
+        const oppId = data.slice('arbexec:'.length);
+        const pending = getPendingConfirmation(oppId);
+
+        if (!pending) {
+          await editOrReply(ctx, '⏱ This opportunity expired or was already handled. It moved on — that\'s normal, arbs close fast.', new InlineKeyboard());
+          return;
+        }
+
+        discardPendingConfirmation(oppId);
+        await editOrReply(ctx, `⏳ Re-verifying live price and executing "${escHtml(pending.opp.eventLabel)}"…`, new InlineKeyboard());
+
+        const settings = await getArbSettings();
+        await executeOpportunity(pending.opp, settings);
+        // executeOpportunity sends its own result notification (success, one-legged, or evaporated-and-aborted).
+        return;
+      }
+
+      // arbskip:<opportunityId>
+      if (data.startsWith('arbskip:')) {
+        const oppId = data.slice('arbskip:'.length);
+        discardPendingConfirmation(oppId);
+        await editOrReply(ctx, '❌ Skipped.', new InlineKeyboard());
         return;
       }
 

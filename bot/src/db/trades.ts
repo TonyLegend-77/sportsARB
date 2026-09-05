@@ -7,6 +7,8 @@ export interface PendingTradeInput {
   side: string;
   requestedSize: number;
   requestedOdds: number;
+  /** Set on both legs of an arb execution so they can be correlated in history. */
+  arbGroupId?: string;
 }
 
 export async function createPendingTrade(input: PendingTradeInput): Promise<string> {
@@ -18,6 +20,7 @@ export async function createPendingTrade(input: PendingTradeInput): Promise<stri
       side: input.side,
       requestedSize: input.requestedSize,
       requestedOdds: input.requestedOdds,
+      arbGroupId: input.arbGroupId ?? null,
       status: 'pending',
     },
   });

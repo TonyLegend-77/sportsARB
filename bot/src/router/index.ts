@@ -12,7 +12,7 @@ const DEFAULT_SLIPPAGE_TOLERANCE = 0.05;
 // REST round-trip; short enough that a stuck seed doesn't hang the panel.
 const ORDERBOOK_WARM_TIMEOUT_MS = 1500;
 
-interface LiquidityLevel {
+export interface LiquidityLevel {
   odds: number;
   size: number;
 }
@@ -32,7 +32,7 @@ interface LiquidityLevel {
  * when the SX top-of-book was tighter. Reading live caches here keeps the
  * router's routing decision in lockstep with what the user sees on screen.
  */
-function liveLevelsFor(
+export function liveLevelsFor(
   platform: Platform,
   externalId: string | null,
   liquidityLevels: string | null,
