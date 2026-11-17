@@ -48,15 +48,21 @@ export interface SignalSettings {
 
 const list = (v: string | undefined) => (v ?? '').split(',').map((x) => x.trim().toLowerCase()).filter(Boolean);
 
+/** Number from an env var; empty, missing, non-numeric or out-of-range values fall back to the default. */
+export function envNum(v: string | undefined, def: number, min = 0): number {
+  const n = v === undefined || v.trim() === '' ? NaN : Number(v);
+  return Number.isFinite(n) && n >= min ? n : def;
+}
+
 export function readSignalSettings(): SignalSettings {
   const e = process.env;
   return {
-    contracts: Number(e.PREDICTEFY_CONTRACTS ?? 100),
-    minRoi: Number(e.PREDICTEFY_MIN_ROI ?? 0.005),
+    contracts: envNum(e.PREDICTEFY_CONTRACTS, 100, 1),
+    minRoi: envNum(e.PREDICTEFY_MIN_ROI, 0.005, 0),
     allowedVenues: list(e.PREDICTEFY_VENUES).length ? new Set(list(e.PREDICTEFY_VENUES)) : null,
-    excludedVenues: new Set(e.PREDICTEFY_EXCLUDE_VENUES === undefined ? ['kalshi'] : list(e.PREDICTEFY_EXCLUDE_VENUES)),
+    excludedVenues: new Set(e.PREDICTEFY_EXCLUDE_VENUES === undefined || e.PREDICTEFY_EXCLUDE_VENUES.trim() === '' ? ['kalshi'] : list(e.PREDICTEFY_EXCLUDE_VENUES)),
     sportsOnly: e.PREDICTEFY_SPORTS_ONLY !== 'false',
-    marketTypes: (e.PREDICTEFY_SPORTS_MARKET_TYPES ?? 'moneyline').split(',').map((s) => s.trim()).filter(Boolean),
+    marketTypes: (e.PREDICTEFY_SPORTS_MARKET_TYPES || 'moneyline').split(',').map((s) => s.trim()).filter(Boolean),
   };
 }
 

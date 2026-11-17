@@ -35,7 +35,7 @@ const envSchema = z.object({
   ARB_SCAN_INTERVAL_MS: z.string().default('8000'),
   // ── Predictefy (cross-venue signal feed) — optional; scanner no-ops without a key ──
   PREDICTEFY_API_KEY: z.string().optional(),
-  PREDICTEFY_API_URL: z.string().url().default('https://data.predictefy.com'),
+  PREDICTEFY_API_URL: z.string().optional(), // empty/unset -> https://data.predictefy.com (adapter default)
   // fetchArbitrage costs 15 credits/call: 60s polling = ~648k credits/30 days (Pro includes 2M); 30s would be ~1.3M.
   PREDICTEFY_SCAN_INTERVAL_MS: z.string().default('60000'),
   // Size (contracts) the executable assessment is made at — depth and fees are judged for this fill.

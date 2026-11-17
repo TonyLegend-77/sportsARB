@@ -2,7 +2,7 @@ import { config } from '../config';
 import { createLogger } from '../logger';
 import { sendSignalAlert } from '../telegram/notify';
 import { PredictefyError } from '../adapters/predictefy';
-import { loadSignals, readSignalSettings, type Signal, type SignalMode } from './predictefySignalsCore';
+import { envNum, loadSignals, readSignalSettings, type Signal, type SignalMode } from './predictefySignalsCore';
 
 const log = createLogger('predictefy-signals');
 
@@ -39,7 +39,7 @@ async function tick(): Promise<void> {
       mode = result.mode;
       log.warn('arbitrage feed needs the Pro plan — falling back to sports screen (indicative only)');
       sendSignalAlert("Predictefy: your key's plan has no arbitrage feed (Pro+). Falling back to indicative sports-screen gaps.");
-      reschedule(Number(config.PREDICTEFY_SCREEN_INTERVAL_MS));
+      reschedule(envNum(config.PREDICTEFY_SCREEN_INTERVAL_MS, 300_000, 10_000));
     }
     let alerts = 0;
     for (const s of result.signals) {
@@ -73,7 +73,7 @@ export function startPredictefySignals(): void {
   }
   log.info({ mode }, 'Predictefy signal scanner started');
   void tick();
-  reschedule(Number(config.PREDICTEFY_SCAN_INTERVAL_MS));
+  reschedule(envNum(config.PREDICTEFY_SCAN_INTERVAL_MS, 60_000, 10_000));
 }
 
 export function stopPredictefySignals(): void {
