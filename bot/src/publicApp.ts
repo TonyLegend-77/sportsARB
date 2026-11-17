@@ -5,6 +5,7 @@ import healthRouter from './routes/health';
 import marketsRouter from './routes/markets';
 import statsRouter from './routes/stats';
 import orderbookRouter from './routes/orderbook';
+import signalsRouter from './routes/signals';
 import { createLogger } from './logger';
 
 const log = createLogger('http:public');
@@ -19,6 +20,8 @@ publicApp.use(healthRouter);
 publicApp.use(marketsRouter);
 publicApp.use(statsRouter);
 publicApp.use(orderbookRouter);
+// Predictefy data is opt-in on the public app (see SIGNALS_ENABLED) — plan terms limit redistribution.
+if (process.env.SIGNALS_ENABLED === 'true') publicApp.use(signalsRouter);
 
 publicApp.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
   log.error({ err }, 'unhandled request error');

@@ -33,6 +33,22 @@ const envSchema = z.object({
   // runtime-toggleable via BotConfig (see arb/config.ts) — this one env var
   // is the only arb setting that requires a restart to change.
   ARB_SCAN_INTERVAL_MS: z.string().default('8000'),
+  // ── Predictefy (cross-venue signal feed) — optional; scanner no-ops without a key ──
+  PREDICTEFY_API_KEY: z.string().optional(),
+  PREDICTEFY_API_URL: z.string().url().default('https://data.predictefy.com'),
+  // fetchArbitrage costs 15 credits/call: 60s polling = ~648k credits/30 days (Pro includes 2M); 30s would be ~1.3M.
+  PREDICTEFY_SCAN_INTERVAL_MS: z.string().default('60000'),
+  // Size (contracts) the executable assessment is made at — depth and fees are judged for this fill.
+  PREDICTEFY_CONTRACTS: z.string().default('100'),
+  // Minimum return on cost (0.005 = 0.5%) after fees, applied client-side to row.roi.
+  PREDICTEFY_MIN_ROI: z.string().default('0.005'),
+  // Allow-list: every leg must be on one of these (e.g. polymarket,sxbet,limitless,predictfun). Unset = any venue.
+  PREDICTEFY_VENUES: z.string().optional(),
+  PREDICTEFY_EXCLUDE_VENUES: z.string().optional(),
+  PREDICTEFY_SPORTS_ONLY: z.string().optional(),
+  // Fallback (Free/Builder plans have no arbitrage feed): sports screen, 5 credits/call.
+  PREDICTEFY_SCREEN_INTERVAL_MS: z.string().default('300000'),
+  PREDICTEFY_SPORTS_MARKET_TYPES: z.string().default('moneyline'),
 });
 
 const parsed = envSchema.safeParse(process.env);

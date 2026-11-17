@@ -132,3 +132,12 @@ export function sendOneLeggedAlert(result: ArbExecutionResult): void {
     log.error({ err }, 'failed to send one-legged arb alert');
   });
 }
+
+/** Plain-text signal alert (Predictefy scanner). Signals only — never triggers execution. */
+export function sendSignalAlert(text: string): void {
+  const bot = getBotInstance();
+  if (!bot) return;
+  bot.api.sendMessage(chatId(), text).catch((err: unknown) => {
+    log.error({ err }, 'failed to send signal alert');
+  });
+}

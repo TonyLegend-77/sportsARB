@@ -1,5 +1,5 @@
 import { NavLink, Outlet } from 'react-router-dom';
-import { LineChart, History as HistoryIcon, Settings as SettingsIcon, BarChart2, Zap } from 'lucide-react';
+import { LineChart, History as HistoryIcon, Settings as SettingsIcon, BarChart2, Zap, Radio } from 'lucide-react';
 import { cn } from '../lib/utils';
 import { GITHUB_REPO_URL, X_PROFILE_URL } from '../lib/constants';
 
@@ -37,6 +37,7 @@ function GithubIcon({ size = 16 }: { size?: number }) {
 const navItems = [
   { to: '/',          label: 'MKTS', icon: LineChart,    end: true },
   { to: '/arbitrage', label: 'ARB',  icon: Zap,          end: undefined },
+  { to: '/signals',   label: 'SIG',  icon: Radio,        end: undefined },
   { to: '/coverage',  label: 'STAT', icon: BarChart2,    end: undefined },
   ...(!isPublic ? [
     { to: '/history',  label: 'HIST', icon: HistoryIcon,  end: undefined },

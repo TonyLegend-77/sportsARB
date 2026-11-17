@@ -192,3 +192,31 @@ export const putConfig = (key: string, value: string) =>
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ value }),
   });
+
+// ── Predictefy cross-venue signals ──────────────────────────────────────────
+export interface SignalLeg {
+  venue: string;
+  label: string;
+  price: number | null;
+  size: number | null;
+}
+
+export interface Signal {
+  id: string;
+  kind: 'arbitrage' | 'indicative';
+  title: string;
+  subtitle: string;
+  roiPct: number;
+  legs: SignalLeg[];
+  detail: string;
+  asOf: string;
+}
+
+export interface SignalsResponse {
+  mode: 'arbitrage' | 'screen';
+  planFallback: boolean;
+  generatedAt: string;
+  signals: Signal[];
+}
+
+export const getSignals = () => apiFetch<SignalsResponse>('/api/signals');

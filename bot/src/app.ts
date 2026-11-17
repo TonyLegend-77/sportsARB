@@ -8,6 +8,7 @@ import configRouter from './routes/config';
 import tradesHistoryRouter from './routes/trades-history';
 import balancesRouter from './routes/balances';
 import statsRouter from './routes/stats';
+import signalsRouter from './routes/signals';
 import { createLogger } from './logger';
 
 const log = createLogger('http');
@@ -26,6 +27,7 @@ app.use(configRouter);
 app.use(tradesHistoryRouter);
 app.use(balancesRouter);
 app.use(statsRouter);
+app.use(signalsRouter);
 
 app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
   log.error({ err }, 'unhandled request error');

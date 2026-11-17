@@ -4,7 +4,8 @@
   "functions": {
     "api/markets.js": { "maxDuration": 60 },
     "api/trade/orderbook.js": { "maxDuration": 30 },
-    "api/stats/markets.js": { "maxDuration": 15 }
+    "api/stats/markets.js": { "maxDuration": 15 },
+    "api/signals.js": { "maxDuration": 60 }
   },
   "rewrites": [
     { "source": "/((?!api/).*)", "destination": "/index.html" }

@@ -11,6 +11,7 @@ import { startPolymarketWsService } from './services/polymarketWs';
 import { startPersistentPolyOddsService } from './services/persistentPolyOdds';
 import { startFixtureFinalizer } from './services/sxFixtureService';
 import { startArbScanner } from './arb/scanner';
+import { startPredictefySignals } from './arb/predictefySignals';
 import { createLogger } from './logger';
 
 const dbLog = createLogger('db');
@@ -60,6 +61,7 @@ async function main() {
     // it on with /arbon or /arbmanual. Manual mode without Telegram running
     // is a dead end (nowhere to see the confirm prompt), so warn about it.
     startArbScanner(Number(config.ARB_SCAN_INTERVAL_MS));
+    startPredictefySignals(); // no-op unless PREDICTEFY_API_KEY is set
     if (!config.TELEGRAM_BOT_TOKEN || !config.TELEGRAM_AUTHORIZED_CHAT_ID) {
       apiLog.info('Arb scanner started, but Telegram is disabled — auto mode will still execute and log, but manual-mode prompts have nowhere to go.');
     }
